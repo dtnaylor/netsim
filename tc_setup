@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+
+import sys
+sys.path.append('common')
+
+import argparse
+import hashlib
+import logging
+from util import check_output, check_both
+
+TC='/usr/bin/env tc'
+DEFAULT_CLASS=9999
+ROOT_Q_HANDLE=9999
+
+
+# TODO: test this
+# Return a consistent traffic class for the given pair of IP/port endpoints
+def class_for_filter(filter):
+    # Hash the filter string to a traffic class number.
+    # If bi-directional, "sort" the endpoints first so we always hash them in
+    # the same order. Otherwise, make sure destination is first.
+    # Valid class numbers are 1 - 9999, but we don't allow 9999 since it's the
+    # default class
+    
+    filter_string = ''.join(sorted(filter_strings(filter)))
+    return (int(hashlib.sha1(filter_string).hexdigest(), 16) % 9998) + 1
+
+
+# TODO: figure out how to filter by port
+# Returns a tc filter string from src to dst. Expects src and dst as 
+# ip:port pairs (separated by a colon).
+def filter_string(src, dst):
+    # TODO: format checking on IP and port
+    # TODO: allow IP prefixes
+
+    # Parse source
+    try:
+        src_ip, src_port = src.split(':')
+        src_ip = 'match ip src %s' % src_ip if src_ip is not '*' else ''
+        src_port = 'match port src %s' % src_port if src_port is not '*' else ''
+    except Exception as e:
+        logging.getLogger(__name__).error('Error parsing endpoint "%s": %s'\
+            % (src, e))
+        exit(1)
+
+    # Parse destination
+    try:
+        dst_ip, dst_port = dst.split(':')
+        dst_ip = 'match ip dst %s' % dst_ip if dst_ip is not '*' else ''
+        dst_port = 'match port dst %s' % dst_port if dst_port is not '*' else ''
+    except Exception as e:
+        logging.getLogger(__name__).error('Error parsing endpoint "%s": %s'\
+            % (dst, e))
+        exit(1)
+
+    return '%s %s %s %s' % (src_ip, src_port, dst_ip, dst_port)
+
+# Return tc filter strings based on the filter supplied at the command line.
+# If the filter is bi-directional ("<->"), there will be two filter strings
+# (one for the "->" direction and one for "<-")
+def filter_strings(filter):
+    if not filter: return ()
+
+    # split the filter string into endpoints and direction arrow
+    try:
+        (endpoint1, direction, endpoint2) = filter.split()
+    except ValueError as e:
+        logging.getLogger(__name__).error('Error parsing filter string "%s": %s.\
+            Did you include spaces around the direction arrow?' % (filter, e))
+        exit(1)
+    except Exception as e:
+        logging.getLogger(__name__).error('Unexpected error parsing filter\
+        string "%s": %s.' % (filter, e))
+        exit(1)
+
+    # generate tc filter strings
+    if direction == '->':
+        return (filter_string(endpoint1, endpoint2),)
+    elif direction == '<-':
+        return (filter_string(endpoint2, endpoint1),)
+    elif direction == '<->':
+        return (filter_string(endpoint1, endpoint2),\
+            filter_string(endpoint2, endpoint1))
+    else:
+        logging.getLogger(__name__).error('Error parsing direction string "%s";\
+            must be "->", "<-", or "<->"' % direction)
+        exit(1)
+
+
+
+# Start traffic shaping on the specified interface by attaching a hierarchical
+# token bucket to the interface (the "root" queue for that interface). We can
+# then add individual classes to the "root" token bucket as needed.
+def start():
+    logging.getLogger(__name__).info('Starting traffic shaping on interface %s' % args.interface)
+
+    check_output('%s qdisc add dev %s root handle %i: htb default %i'\
+        % (TC, args.interface, ROOT_Q_HANDLE, DEFAULT_CLASS))
+
+    # make a default class for normal traffic
+    check_output('%s class replace dev %s parent %i: classid %i:%i htb rate 1000mbit ceil 1000mbit'\
+        % (TC, args.interface, ROOT_Q_HANDLE, ROOT_Q_HANDLE, DEFAULT_CLASS))
+
+
+
+# Stop traffic shaping on the specified interface by removing the root queueing
+# discipline on that interface (the token bucket we added in start())
+def stop():
+    logging.getLogger(__name__).info('Stopping traffic shaping on interface %s' % args.interface)
+
+    out = check_both('%s qdisc del dev %s root' % (TC, args.interface), shouldPrint=False, check=False)
+    if out[1] is not 0 and 'RTNETLINK answers: No such file or directory' not in out[0][0]:
+        raise Exception("Error stopping traffic shaping")
+
+
+# Update the traffic class associated with the pair of IP addresses specified
+# as command line arguments
+def update():
+    # Figure out which traffic class we're updating
+    if args.traffic_class:
+        traffic_class = args.traffic_class
+    elif args.filter:
+        traffic_class = class_for_filter(args.filter)
+    else:
+        traffic_class = DEFAULT_CLASS
+
+    # Update the queues for the traffic class with the new BW/latency
+    check_output('%s class replace dev %s parent %i: classid %i:%i htb rate %s ceil %s cburst 0kb burst 1600kb'\
+        % (TC, args.interface, ROOT_Q_HANDLE, ROOT_Q_HANDLE, traffic_class,\
+        args.bandwidth, args.bandwidth))
+    check_output('%s qdisc replace dev %s parent %i:%i handle %i: netem delay %s'\
+        % (TC, args.interface, ROOT_Q_HANDLE, traffic_class, traffic_class,\
+        args.latency))
+
+    # Update the rules mapping IP address pairs to the traffic class
+    if args.filter:
+        U32='%s filter replace dev %s protocol ip parent %i: prio 1 u32'\
+            % (TC, args.interface, ROOT_Q_HANDLE)
+
+        for filter in filter_strings(args.filter):
+            check_output('%s %s flowid %i:%i'
+                % (U32, filter, ROOT_Q_HANDLE, traffic_class))
+
+
+def show():
+    print '=============== Queue Disciplines ==============='
+    check_output('%s -s qdisc show dev %s' % (TC, args.interface))
+    print '\n================ Traffic Classes ================'
+    check_output('%s -s class show dev %s' % (TC, args.interface))
+    print '\n==================== Filters ===================='
+    check_output('%s -s filter show dev %s' % (TC, args.interface))
+
+
+def main():
+    if args.command == 'start':
+        start()
+    elif args.command == 'stop':
+        stop()
+    elif args.command == 'update':
+        update()
+    elif args.command == 'show':
+        show()
+
+
+if __name__ == "__main__":
+    # set up command line args
+    parser = argparse.ArgumentParser(description='Adjust traffic shaping settings')
+    parser.add_argument('command', choices=['start','stop','show','update'], help='command: start or stop traffic shaping; show current filters; or update a filter')
+    parser.add_argument('-f', '--filter', default=None, help='Restrict traffic shaping to specified flow. If not provided, the class specified with -c is updated. If neither is provided, the default class is updated. Example filters:\n\t"192.168.0.1:* -> 192.168.0.2:80", "*:* <-> *:80"')
+    parser.add_argument('-i', '--interface', default='lo', help='the interface to adjust')
+    parser.add_argument('-b', '--bandwidth', default='1000mbit', help='download bandwidth (e.g., 100mbit)')
+    parser.add_argument('-l', '--latency', default='0ms', help='outbound latency (e.g., 20ms)')
+    parser.add_argument('-c', '--traffic_class', type=int, default=0, help='traffic class number to update. If none provided, the hash of the IP pair is used. If no IP pair is provided, the default class is updated.')
+    parser.add_argument('-q', '--quiet', action='store_true', default=False, help='only print errors')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help='print debug info. --quiet wins if both are present')
+    args = parser.parse_args()
+    
+    # set up logging
+    if args.quiet:
+        level = logging.WARNING
+    elif args.verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logging.basicConfig(
+        format = "%(levelname) -10s %(asctime)s %(module)s:%(lineno) -7s %(message)s",
+        level = level
+    )
+
+    main()
