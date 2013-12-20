@@ -26,7 +26,6 @@ def class_for_filter(filter):
     return (int(hashlib.sha1(filter_string).hexdigest(), 16) % 9998) + 1
 
 
-# TODO: figure out how to filter by port
 # Returns a tc filter string from src to dst. Expects src and dst as 
 # ip:port pairs (separated by a colon).
 def filter_string(src, dst):
@@ -37,7 +36,7 @@ def filter_string(src, dst):
     try:
         src_ip, src_port = src.split(':')
         src_ip = 'match ip src %s' % src_ip if src_ip is not '*' else ''
-        src_port = 'match port src %s' % src_port if src_port is not '*' else ''
+        src_port = 'match ip sport %s 0xffff' % src_port if src_port is not '*' else ''
     except Exception as e:
         logging.getLogger(__name__).error('Error parsing endpoint "%s": %s'\
             % (src, e))
@@ -47,7 +46,7 @@ def filter_string(src, dst):
     try:
         dst_ip, dst_port = dst.split(':')
         dst_ip = 'match ip dst %s' % dst_ip if dst_ip is not '*' else ''
-        dst_port = 'match port dst %s' % dst_port if dst_port is not '*' else ''
+        dst_port = 'match ip dport %s 0xffff' % dst_port if dst_port is not '*' else ''
     except Exception as e:
         logging.getLogger(__name__).error('Error parsing endpoint "%s": %s'\
             % (dst, e))
